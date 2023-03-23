@@ -129,6 +129,7 @@ class SetFitHead(models.Dense):
         self,
         in_features: Optional[int] = None,
         out_features: int = 2,
+        use_multilayer: bool = False,
         temperature: float = 1.0,
         eps: float = 1e-5,
         bias: bool = True,
@@ -144,12 +145,27 @@ class SetFitHead(models.Dense):
             out_features = 2
 
         if in_features is not None:
-            self.linear = nn.Linear(in_features, out_features, bias=bias)
+            if use_multilayer:
+                self.features_module = nn.Sequential(
+                    nn.Linear(in_features, 128),
+                    nn.ReLU(),
+                    nn.Dropout(),
+                    nn.Linear(128, 32),
+                    # nn.ReLU(),
+                    # nn.Dropout(),
+                    # nn.Linear(128, 32),
+                )
+                self.linear = nn.Sequential(nn.ReLU(), nn.Dropout(), nn.Linear(32, out_features, bias=bias))
+            else:
+                self.features_module = None
+                self.linear = nn.Linear(in_features, out_features, bias=bias)
         else:
+            self.features_module = None
             self.linear = nn.LazyLinear(out_features, bias=bias)
 
         self.in_features = in_features
         self.out_features = out_features
+        self.use_multilayer = use_multilayer
         self.temperature = temperature
         self.eps = eps
         self.bias = bias
@@ -187,6 +203,8 @@ class SetFitHead(models.Dense):
             assert "sentence_embedding" in features
             is_features_dict = True
         x = features["sentence_embedding"] if is_features_dict else features
+        if self.features_module is not None:
+            x = self.features_module(x)
         logits = self.linear(x)
         logits = logits / (temperature + self.eps)
         if self.multitarget:  # multiple targets per item
@@ -204,17 +222,31 @@ class SetFitHead(models.Dense):
 
         return logits, probs
 
+    def learned_classifier_embeddings(self, x: torch.Tensor) -> torch.Tensor:
+        if self.features_module is not None:
+            self.eval()
+            return self.features_module(x)
+        else:
+            return None
+
     def predict_proba(self, x_test: torch.Tensor) -> torch.Tensor:
         self.eval()
 
         return self(x_test)[1]
 
-    def predict(self, x_test: torch.Tensor) -> torch.Tensor:
+    def predict(self, x_test: torch.Tensor, return_embeddings: bool = False) -> torch.Tensor:
         probs = self.predict_proba(x_test)
 
         if self.multitarget:
-            return torch.where(probs >= 0.5, 1, 0)
-        return torch.argmax(probs, dim=-1)
+            if return_embeddings:
+                return self.learned_classifier_embeddings(x_test), torch.where(probs >= 0.5, 1, 0)
+            else:
+                return torch.where(probs >= 0.5, 1, 0)
+
+        if return_embeddings:
+            return self.learned_classifier_embeddings(x_test), torch.argmax(probs, dim=-1)
+        else:
+            return torch.argmax(probs, dim=-1)
 
     def get_loss_fn(self):
         if self.multitarget:  # if sigmoid output
@@ -404,20 +436,27 @@ class SetFitModel(PyTorchModelHubMixin):
         for param in model.parameters():
             param.requires_grad = not to_freeze
 
-    def predict(self, x_test: List[str], as_numpy: bool = False) -> Union[torch.Tensor, "ndarray"]:
+    def predict(
+        self, x_test: List[str], as_numpy: bool = False, return_embeddings: bool = False
+    ) -> Union[torch.Tensor, "ndarray"]:
         embeddings = self.model_body.encode(
             x_test,
             normalize_embeddings=self.normalize_embeddings,
             convert_to_tensor=self.has_differentiable_head,
         )
 
-        outputs = self.model_head.predict(embeddings)
+        if return_embeddings:
+            classifier_feature_embeddings, outputs = self.model_head.predict(embeddings, return_embeddings)
+        else:
+            outputs = self.model_head.predict(embeddings)
 
         if as_numpy and self.has_differentiable_head:
             outputs = outputs.detach().cpu().numpy()
         elif not as_numpy and not self.has_differentiable_head:
             outputs = torch.from_numpy(outputs)
 
+        if return_embeddings:
+            return embeddings, classifier_feature_embeddings, outputs
         return outputs
 
     def predict_proba(self, x_test: List[str], as_numpy: bool = False) -> Union[torch.Tensor, "ndarray"]:
@@ -532,6 +571,7 @@ class SetFitModel(PyTorchModelHubMixin):
             model_head = joblib.load(model_head_file)
         else:
             head_params = model_kwargs.get("head_params", {})
+
             if use_differentiable_head:
                 if multi_target_strategy is None:
                     use_multitarget = False

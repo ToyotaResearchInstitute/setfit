@@ -372,9 +372,7 @@ class SetFitTrainer:
                             np.array(x_train), np.array(y_train), train_examples
                         )
                     else:
-                        train_examples = sentence_pairs_generation(
-                            np.array(x_train), np.array(y_train), train_examples
-                        )
+                        train_examples = sentence_pairs_generation(np.array(x_train), np.array(y_train), train_examples)
 
                 train_dataloader = DataLoader(train_examples, shuffle=True, batch_size=batch_size)
                 train_loss = self.loss_class(self.model.model_body)
@@ -409,6 +407,28 @@ class SetFitTrainer:
                 max_length=max_length,
                 show_progress_bar=True,
             )
+
+    def compute_embeddings_and_predictions(self, dataset: "Dataset"):
+        """
+        Computes sentence_transformer embeddings (384D), classifier_embeddings, if available and the prediction
+
+        Returns:
+
+        """
+        self._validate_column_mapping(dataset)
+
+        if self.column_mapping is not None:
+            logger.info("Applying column mapping to dataset")
+            dataset = self._apply_column_mapping(dataset, self.column_mapping)
+
+        x_test = dataset["text"]
+
+        logger.info("***** Running evaluation *****")
+        sentence_transformer_embeddings, classifier_feature_embeddings, y_pred = self.model.predict(
+            x_test, return_embeddings=True
+        )
+
+        return sentence_transformer_embeddings, classifier_feature_embeddings, y_pred
 
     def evaluate(self):
         """
